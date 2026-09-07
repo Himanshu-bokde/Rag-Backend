@@ -7,7 +7,8 @@ from langchain_qdrant import QdrantVectorStore
 
 
 
-def process_documnt(document_id:str,file_path:str):
+
+def process_documnt(document_id:str,file_path:str,document_type:str,department:str,year:str):
     print(f"Processing document: {document_id}")
 
     reader = PdfReader(file_path)
@@ -41,7 +42,15 @@ def process_documnt(document_id:str,file_path:str):
     chunk_overlap=400
     )
 
-    chunks = text_splitter.create_documents([text])
+    chunks = text_splitter.create_documents([text],metadatas=[
+            {
+                "document_id": document_id,
+                "document_type": document_type,
+                "department":department,
+                "year":year,
+                "file_name": Path(file_path).name
+            }
+        ])
 
 
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")

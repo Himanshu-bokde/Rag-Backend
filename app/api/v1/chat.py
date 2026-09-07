@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from sentence_transformers import CrossEncoder
@@ -16,6 +16,22 @@ route = APIRouter(
 )
 
 
+query_filter = Filter(
+    must=[
+        FieldCondition(
+            key="metadata.department",
+            match=MatchValue(value="IT")
+        ),
+        FieldCondition(
+            key="metadata.document_type",
+            match=MatchValue(value="nodejs")
+        ),
+        FieldCondition(
+            key="metadata.year",
+            match=MatchValue(value=2026)
+        )
+    ]
+)
 # Gemini client
 client = genai.Client(
     api_key=settings.GEMINI_API_KEY
@@ -57,7 +73,8 @@ async def chat(request: ChatRequest):
 
     search_results = vector_db.similarity_search(
         query=question,
-        k=20
+        k=20,
+        filter=query_filter
     )
 
     print("Retrieved Chunks:", len(search_results))

@@ -1,7 +1,7 @@
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter,File,HTTPException,UploadFile,status
+from fastapi import APIRouter,File,HTTPException,UploadFile,status,Form
 
 from app.core.config import settings
 from app.schemas.document import UploadResponse
@@ -15,7 +15,9 @@ route = APIRouter(
 
 
 @route.post('/upload',response_model=UploadResponse,status_code=status.HTTP_200_OK)
-async def upload_document(file:UploadFile=File(...)):
+async def upload_document(file:UploadFile=File(...),document_type: str = Form(...),
+    department: str = Form(...),
+    year: int = Form(...)):
     # Validate Extension
     if file.content_type != "application/pdf":
         raise HTTPException(
@@ -57,7 +59,10 @@ async def upload_document(file:UploadFile=File(...)):
     job = decument_queue.enqueue(
         process_documnt,
         document_id,
-        str(file_path)
+        str(file_path),
+        document_type,
+        department,
+        year
     )
 
     print("JON",job)
