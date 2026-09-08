@@ -16,22 +16,24 @@ route = APIRouter(
 )
 
 
-query_filter = Filter(
-    must=[
-        FieldCondition(
-            key="metadata.department",
-            match=MatchValue(value="IT")
-        ),
-        FieldCondition(
-            key="metadata.document_type",
-            match=MatchValue(value="nodejs")
-        ),
-        FieldCondition(
-            key="metadata.year",
-            match=MatchValue(value=2026)
-        )
-    ]
-)
+# query_filter = Filter(
+#     must=[
+#         FieldCondition(
+#             key="metadata.department",
+#             match=MatchValue(value="IT")
+#         ),
+#         FieldCondition(
+#             key="metadata.document_type",
+#             match=MatchValue(value="nodejs")
+#         ),
+#         FieldCondition(
+#             key="metadata.year",
+#             match=MatchValue(value=2026)
+#         )
+#     ]
+# )
+
+
 # Gemini client
 client = genai.Client(
     api_key=settings.GEMINI_API_KEY
@@ -74,7 +76,7 @@ async def chat(request: ChatRequest):
     search_results = vector_db.similarity_search(
         query=question,
         k=20,
-        filter=query_filter
+        # filter=query_filter
     )
 
     print("Retrieved Chunks:", len(search_results))
