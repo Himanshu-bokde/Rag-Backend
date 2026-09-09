@@ -1,13 +1,25 @@
 from fastapi import APIRouter
-from qdrant_client.models import Filter, FieldCondition, MatchValue
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from sentence_transformers import CrossEncoder
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Prefetch,
+    FusionQuery,
+    Fusion,
+    SparseVector,
+    Filter,
+    FieldCondition,
+    MatchValue,
+)
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.core.config import settings
 
 from google import genai
+
+# Sparse embedding model
+from fastembed import SparseTextEmbedding
 
 
 route = APIRouter(
@@ -16,130 +28,299 @@ route = APIRouter(
 )
 
 
-# query_filter = Filter(
-#     must=[
-#         FieldCondition(
-#             key="metadata.department",
-#             match=MatchValue(value="IT")
-#         ),
-#         FieldCondition(
-#             key="metadata.document_type",
-#             match=MatchValue(value="nodejs")
-#         ),
-#         FieldCondition(
-#             key="metadata.year",
-#             match=MatchValue(value=2026)
-#         )
-#     ]
-# )
+# ============================================================
+# 1. Gemini
+# ============================================================
 
-
-# Gemini client
 client = genai.Client(
     api_key=settings.GEMINI_API_KEY
 )
 
 
-# Embedding model
-embeddings_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+# ============================================================
+# 2. Qdrant
+# ============================================================
+
+qdrant = QdrantClient(
+    url="http://localhost:6333"
 )
+
+
+COLLECTION_NAME = "learning_rag-demo"
+
+
+# ============================================================
+# 3. Embedding Models
+# ============================================================
+
+# Dense model
+dense_model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+# Sparse model
+sparse_model = SparseTextEmbedding(
+    model_name="prithivida/Splade_PP_en_v1"
+)
+
+
+# ============================================================
+# 4. Cross Encoder
+# ============================================================
 
 reranker = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
 
-# Connect to existing Qdrant collection
-vector_db = QdrantVectorStore.from_existing_collection(
-    url="http://localhost:6333",
-    collection_name="learning_rag-demo",
-    embedding=embeddings_model,
-)
 
+# ============================================================
+# 5. Optional Metadata Filter
+# ============================================================
+
+# Example:
+#
+# query_filter = Filter(
+#     must=[
+#         FieldCondition(
+#             key="department",
+#             match=MatchValue(value="IT")
+#         ),
+#         FieldCondition(
+#             key="document_type",
+#             match=MatchValue(value="nodejs")
+#         ),
+#         FieldCondition(
+#             key="year",
+#             match=MatchValue(value="2026")
+#         )
+#     ]
+# )
+
+
+# ============================================================
+# 6. Chat API
+# ============================================================
 
 @route.post("/", response_model=ChatResponse)
 async def chat(request: ChatRequest):
 
-    # --------------------------------
-    # 1. Get question from user
-    # --------------------------------
+    # --------------------------------------------------------
+    # 1. Get user question
+    # --------------------------------------------------------
 
     question = request.question
 
+    print("\n========================================")
     print("User Question:", question)
+    print("========================================")
 
 
-    # --------------------------------
-    # 2. Search Qdrant
-    # --------------------------------
+    # --------------------------------------------------------
+    # 2. Create Dense Query Vector
+    # --------------------------------------------------------
 
-    search_results = vector_db.similarity_search(
-        query=question,
-        k=20,
-        # filter=query_filter
+    dense_vector = dense_model.encode(
+        question
+    ).tolist()
+
+
+    # --------------------------------------------------------
+    # 3. Create Sparse Query Vector
+    # --------------------------------------------------------
+
+    sparse_embedding = list(
+        sparse_model.embed([question])
+    )[0]
+
+
+    sparse_vector = SparseVector(
+        indices=sparse_embedding.indices.tolist(),
+        values=sparse_embedding.values.tolist()
     )
 
-    print("Retrieved Chunks:", len(search_results))
+
+    # --------------------------------------------------------
+    # 4. Hybrid Search
+    # --------------------------------------------------------
+
+    results = qdrant.query_points(
+
+        collection_name=COLLECTION_NAME,
+
+        # Dense + Sparse retrieval
+        prefetch=[
+
+            # -------------------------
+            # Dense Search
+            # -------------------------
+
+            Prefetch(
+                query=dense_vector,
+                using="dense",
+                limit=20
+            ),
+
+            # -------------------------
+            # Sparse Search
+            # -------------------------
+
+            Prefetch(
+                query=sparse_vector,
+                using="sparse",
+                limit=20
+            ),
+        ],
+
+        # -------------------------
+        # RRF Fusion
+        # -------------------------
+
+        query=FusionQuery(
+            fusion=Fusion.RRF
+        ),
+
+        # query_filter=query_filter,
+
+        # Final hybrid candidates
+        limit=20,
+
+        # Return payload
+        with_payload=True
+    )
 
 
-# --------------------------------
-# 3. Rerank retrieved chunks
-# --------------------------------
-    
+    hybrid_results = results.points
+
+    print(
+        "Hybrid Retrieved Chunks:",
+        len(hybrid_results)
+    )
+
+
+    # --------------------------------------------------------
+    # 5. Convert Qdrant results to text
+    # --------------------------------------------------------
+
+    documents = []
+
+    for result in hybrid_results:
+
+        payload = result.payload or {}
+
+        text = payload.get(
+            "text",
+            ""
+        )
+
+        documents.append(
+            {
+                "text": text,
+                "page": payload.get(
+                    "page",
+                    "Unknown"
+                ),
+                "document_id": payload.get(
+                    "document_id"
+                ),
+                "score": result.score
+            }
+        )
+
+
+    # --------------------------------------------------------
+    # 6. Cross Encoder Reranking
+    # --------------------------------------------------------
+
     pairs = [
-        (question,doc.page_content)
-        for doc in search_results
+        (
+            question,
+            document["text"]
+        )
+        for document in documents
     ]
 
-    scores = reranker.predict(pairs)
+
+    scores = reranker.predict(
+        pairs
+    )
 
 
-    ranked_result = sorted(
-        zip(search_results,scores),
-        key=lambda x:x[1],
+    # --------------------------------------------------------
+    # 7. Combine documents + reranker scores
+    # --------------------------------------------------------
+
+    ranked_results = sorted(
+        zip(documents, scores),
+        key=lambda x: x[1],
         reverse=True
     )
 
+
+    # --------------------------------------------------------
+    # 8. Select Top 5
+    # --------------------------------------------------------
+
     top_n = 5
 
-    final_results = ranked_result[:top_n]
-
-    print("Final Chunks After Reranking:", len(final_results))
-
-    for doc, score in final_results:
-       print("Score:", score)
-       print("Page:", doc.metadata.get("page"))
-       print()
+    final_results = ranked_results[:top_n]
 
 
-    # --------------------------------
-    # 4. Build context
-    # --------------------------------
+    print(
+        "Final Chunks After Reranking:",
+        len(final_results)
+    )
 
-    # context = ""
 
-    # for doc in search_results:
-    #     page_content = doc.page_content
-    #     context += f"""
-    #       {page_content}
-    #     """
+    # --------------------------------------------------------
+    # 9. Debug Results
+    # --------------------------------------------------------
 
+    for document, score in final_results:
+
+        print(
+            "Reranker Score:",
+            score
+        )
+
+        print(
+            "PDF Page:",
+            document["page"]
+        )
+
+        print(
+            "Text:",
+            document["text"][:200]
+        )
+
+        print("----------------------------------------")
+
+
+    # --------------------------------------------------------
+    # 10. Build Context
+    # --------------------------------------------------------
 
     context = ""
 
-    for doc, score in final_results:
 
-       page = doc.metadata.get("page", "Unknown")
+    for document, score in final_results:
 
-       context += f"""
-        [PDF Page: {page}]
-        {doc.page_content}
-        """
+        page = document["page"]
+
+        text = document["text"]
+
+        context += f"""
+
+[PDF Page: {page}]
+
+{text}
+
+"""
 
 
-    # --------------------------------
-    # 4. Create prompt
-    # --------------------------------
+    # --------------------------------------------------------
+    # 11. Build Prompt
+    # --------------------------------------------------------
 
     prompt = f"""
 You are a helpful AI assistant.
@@ -153,7 +334,9 @@ Rules:
 2. Do NOT use your own knowledge.
 3. Do NOT make up information.
 4. If the answer is not available in the context, say:
-   "I could not find the answer in the provided PDF."
+
+"I could not find the answer in the provided PDF."
+
 5. Always mention the PDF page number where the answer was found.
 6. Tell the user which PDF page they can open to learn more.
 7. Keep the answer clear and concise.
@@ -170,29 +353,33 @@ Rules:
 """
 
 
-    # --------------------------------
-    # 5. Send to Gemini
-    # --------------------------------
+    # --------------------------------------------------------
+    # 12. Send to Gemini
+    # --------------------------------------------------------
 
     response = client.models.generate_content(
+
         model="gemini-3.6-flash",
+
         contents=prompt
     )
 
 
-    # --------------------------------
-    # 6. Get Gemini answer
-    # --------------------------------
+    # --------------------------------------------------------
+    # 13. Get Answer
+    # --------------------------------------------------------
 
     answer = response.text
 
+
     print("\n================ ANSWER ================\n")
+
     print(answer)
 
 
-    # --------------------------------
-    # 7. Return to frontend
-    # --------------------------------
+    # --------------------------------------------------------
+    # 14. Return Response
+    # --------------------------------------------------------
 
     return ChatResponse(
         answer=answer
